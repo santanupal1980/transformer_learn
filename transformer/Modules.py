@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch
 from torch import nn
 from torch.autograd import Function
-import math
+from math import sqrt
 
 from transformer import Constants
 
@@ -36,7 +36,7 @@ class ScaledDotProductAttention(nn.Module):
         #attn = torch.matmul(q, k.transpose(1, 2))
         attn = torch.matmul(q, k.transpose(2, 3))
         # Scale
-        attn = attn / self.temperature
+        #attn = attn / self.temperature
 
         # Mask
         if mask is not None:
@@ -52,32 +52,49 @@ class ScaledDotProductAttention(nn.Module):
 
         return output, attn
 
+class SparseNormer(nn.Module):
+
+    # dim: dimension to normalize
+
+    def __init__(self, dim=-1, ieps=1e-32):
+        super(SparseNormer, self).__init__()
+
+        self.dim = dim
+        self.bias = nn.Parameter(torch.zeros(1))
+        self.act = nn.ReLU(inplace=True)
+        self.ieps = ieps
+
+    def forward(self, x):
+        _tmp = self.act(x + self.bias)
+        _tmp = _tmp * _tmp
+
+        # fix zero-devision in case all elements in _tmp are 0.
+        return _tmp / (_tmp.sum(self.dim, keepdim=True) + self.ieps)
+
 class MultiHeadAttention(nn.Module):
     ''' Multi-Head Attention module '''
 
-    def __init__(self, n_head, d_model, d_k, d_v, dropout=0.1):
+    def __init__(self, n_head, d_model, d_k, d_v, dropout=0.1, sparsenorm = False):
         super().__init__()
 
+        self.attn_dim = d_model // n_head
+        self.hsize = self.attn_dim * n_head
         self.n_head = n_head
-        self.head_size = d_model // n_head
+
         self.d_k = d_k
         self.d_v = d_v
 
-        self.w_qs = nn.Linear(d_model, n_head * d_k)
-        self.w_ks = nn.Linear(d_model, n_head * d_k)
-        self.w_vs = nn.Linear(d_model, n_head * d_v)
+        self.qs = nn.Linear(d_model, self.hsize)
+        self.ks = nn.Linear(d_model, self.hsize)
+        self.vs = nn.Linear(d_model, self.hsize)
 
+        #self.outer = nn.Linear(self.hsize, osize, bias=enable_bias)
 
-        #nn.init.normal_(self.w_qs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
-        #nn.init.normal_(self.w_ks.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
-        #nn.init.normal_(self.w_vs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_v)))
+        self.normer = SparseNormer(dim=-1) if sparsenorm else nn.Softmax(dim=-1)
 
-        self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5))
-        self.layer_norm = nn.LayerNorm(d_model)
+        #self.layer_norm = nn.LayerNorm(d_model)
 
-        #self.fc = nn.Linear(n_head * d_v, d_model)
-        #nn.init.xavier_normal_(self.fc.weight)
-        self.output_layer = nn.Linear(d_model, d_model)
+        self.output_layer = nn.Linear(self.hsize, d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, q, k, v, mask=None):
@@ -100,13 +117,12 @@ class MultiHeadAttention(nn.Module):
         batch_size, len_q, _ = q.size()
         batch_size, len_k, _ = k.size()
         batch_size, len_v, _ = v.size()
+
+        adim = self.attn_dim
         residual = q
 
 
         ''' # Linear
-        q = self.w_qs(q).view(sz_b, len_q, n_head, d_k)
-        k = self.w_ks(k).view(sz_b, len_k, n_head, d_k)
-        v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
 
         q = q.permute(2, 0, 1, 3).contiguous().view(-1, len_q, d_k)  # (n*b) x lq x dk
         k = k.permute(2, 0, 1, 3).contiguous().view(-1, len_k, d_k)  # (n*b) x lk x dk
@@ -114,33 +130,32 @@ class MultiHeadAttention(nn.Module):
 
         '''
 
-        # reshape q, k, v for our computation to [batch_size, num_heads, ..]
-        k = k.view(batch_size, -1, self.n_head, self.head_size).transpose(1, 2)
-        v = v.view(batch_size, -1, self.n_head, self.head_size).transpose(1, 2)
-        q = q.view(batch_size, -1, self.n_head, self.head_size).transpose(1, 2)
+        Q = self.qs(q).view(batch_size, len_q, n_head, adim).transpose(1, 2)
+        K = self.ks(k).view(batch_size, len_k, n_head, adim).transpose(1, 2)
+        V = self.vs(v).view(batch_size, len_v, n_head, adim).transpose(1, 2)
 
         # compute scores
-        q = q / math.sqrt(self.head_size)
+        scores = torch.div(torch.matmul(Q, K.transpose(2, 3)), sqrt(adim))
 
-        #mask = mask.repeat(n_head, 1, 1)  # (n*b) x .. x ..
+        if mask is not None:
+            scores.masked_fill_(torch.unsqueeze(mask, 1).expand_as(scores), -1e32)
 
-        # Scaled Dot-Product Attention
-        output, attn = self.attention(q, k, v, mask=mask)
+        scores = self.normer(scores)
 
-        output = output.transpose(1, 2).contiguous().view(
-            batch_size, -1, self.n_head * self.head_size)
+        if self.dropout is not None:
+            scores = self.dropout(scores)
 
-        #output = output.view(n_head, batch_size, len_q, d_v)
-        #output = output.permute(1, 2, 0, 3).contiguous().view(batch_size, len_q, -1)  # b x lq x (n*dv)
 
-        #output = self.dropout(self.fc(output))
 
-        output = self.output_layer(output)
+        output = torch.matmul(scores, V).transpose(1, 2).contiguous()
+
+
+        output = self.output_layer(output.view(batch_size, len_q, self.hsize))
 
         # Add and Norm
         #output = self.layer_norm(output.transpose(1, 2) + residual)
 
-        return output, attn
+        return output, scores
 
 class utils:
 
@@ -189,7 +204,160 @@ class utils:
         return subsequent_mask
 
 
+# Accelerated MultiHeadAttn for self attention, use when Q == K == V
+class SelfAttn(nn.Module):
 
+    # isize: input dimension
+    # hsize: hidden dimension
+    # osize: output size of this layer
+    # num_head: number of heads
+    # dropout: dropout probability
+    # sparsenorm: using sparse normer or standard softmax
+
+    def __init__(self, input_size, hid_size, out_size, num_head=8, dropout=0.0, enable_bias=False, sparsenorm=False):
+
+        super(SelfAttn, self).__init__()
+
+        self.attn_dim = hid_size // num_head
+        self.hid_size = self.attn_dim * num_head
+        self.num_head = num_head
+
+        self.adaptor = nn.Linear(input_size, self.hid_size * 3, bias=enable_bias)
+
+        self.outer = nn.Linear(self.hid_size, out_size, bias=enable_bias)
+
+        # self.normer = MHSparseNormer(num_head, dim=-1) if sparsenorm else nn.Softmax(dim=-1)
+        self.normer = SparseNormer(dim=-1) if sparsenorm else nn.Softmax(dim=-1)
+
+        self.drop = nn.Dropout(dropout, inplace=sparsenorm) if dropout > 0.0 else None
+
+    # iQ: query (bsize, num_query, vsize)
+    # mask (bsize, num_query, seql)
+    # iK: key/value (bsize, seql, vsize), in case key != query, for efficient decoding
+
+    def forward(self, iQ, mask=None, iK=None):
+
+        bsize, nquery, _ = iQ.size()
+        nheads = self.num_head
+        adim = self.attn_dim
+
+        # real_iQ: MultiHead iQ (bsize, num_query, vsize) => (bsize, nheads, nquery, adim)
+        # real_iK: MultiHead iK (bsize, nquery, vsize) => (bsize, nheads, nquery, adim)
+        # real_iV: MultiHead iV (bsize, nquery, vsize) => (bsize, nheads, nquery, adim)
+
+        if iK is None:
+
+            _out = self.adaptor(iQ)
+
+            Q, K, V = _out.narrow(-1, 0, self.hid_size).contiguous().view(bsize, nquery, nheads,adim).transpose(1,2), \
+                      _out.narrow(-1, self.hid_size, self.hid_size).contiguous().view(bsize, nquery, nheads, adim).transpose(1, 2), \
+                       _out.narrow(-1, self.hid_size + self.hid_size, self.hid_size).contiguous().view(bsize, nquery, nheads, adim).transpose(1, 2)
+        else:
+
+            real_iQ, _out = F.linear(iQ, self.adaptor.weight.narrow(0, 0, self.hsize),
+                                          self.adaptor.bias.narrow(0, 0,
+                                                                   self.hsize) if self.adaptor.bias else None).view(
+                bsize, nquery, nheads, adim).transpose(1, 2), F.linear(iK,
+                                                                            self.adaptor.weight.narrow(0, self.hsize,
+                                                                                                       self.hsize + self.hsize),
+                                                                            self.adaptor.bias.narrow(0, self.hsize,
+                                                                                                     self.hsize + self.hsize) if self.adaptor.bias else None)
+
+            seql = iK.size(1)
+
+            real_iK, real_iV = _out.narrow(-1, 0, self.hsize).contiguous().view(bsize, seql, nheads, adim).transpose(1,
+                                                                                                                     2), _out.narrow(
+                -1, self.hsize, self.hsize).contiguous().view(bsize, seql, nheads, adim).transpose(1, 2)
+
+        # scores (bsize, nheads, nquery, adim) * (bsize, nheads, nquery, adim)' => (bsize, nheads, nquery, nquery)
+
+        scores = torch.div(torch.matmul(real_iQ, real_iK.transpose(2, 3)), sqrt(adim))
+
+        if mask is not None:
+            scores.masked_fill_(torch.unsqueeze(mask, 1).expand_as(scores), -1e32)
+
+        scores = self.normer(scores)
+
+        if self.drop is not None:
+            scores = self.drop(scores)
+
+        # oMA: output of MultiHeadAttention T((bsize, nheads, nquery, nquery) * (bsize, nheads, nquery, adim)) => (bsize, nquery, nheads, adim)
+
+        oMA = torch.matmul(scores, real_iV).transpose(1, 2).contiguous()
+
+        # output of this layer (bsize, nquery, nheads, adim) => (bsize, nquery, osize)
+
+        return self.outer(oMA.view(bsize, nquery, self.hsize))
+
+
+# Accelerated MultiHeadAttn for cross attention, use when K == V
+class CrossAttn(nn.Module):
+
+    # isize: input dimension
+    # hsize: hidden dimension
+    # osize: output size of this layer
+    # num_head: number of heads
+    # dropout: dropout probability
+    # sparsenorm: using sparse normer or standard softmax
+
+    def __init__(self, isize, hsize, osize, num_head=8, dropout=0.0, enable_bias=False, sparsenorm=False):
+
+        super(CrossAttn, self).__init__()
+
+        self.attn_dim = hsize // num_head
+        self.hsize = self.attn_dim * num_head
+        self.num_head = num_head
+
+        self.query_adaptor = nn.Linear(isize, self.hsize, bias=enable_bias)
+        self.kv_adaptor = nn.Linear(isize, self.hsize * 2, bias=enable_bias)
+
+        self.outer = nn.Linear(self.hsize, osize, bias=enable_bias)
+
+        # self.normer = MHSparseNormer(num_head, dim=-1) if sparsenorm else nn.Softmax(dim=-1)
+        self.normer = SparseNormer(dim=-1) if sparsenorm else nn.Softmax(dim=-1)
+
+        self.drop = nn.Dropout(dropout, inplace=sparsenorm) if dropout > 0.0 else None
+
+    # iQ: query (bsize, num_query, vsize)
+    # iK: keys (bsize, seql, vsize)
+    # mask (bsize, num_query, seql)
+
+    def forward(self, iQ, iK, mask=None):
+
+        bsize, nquery, _ = iQ.size()
+        seql = iK.size(1)
+        nheads = self.num_head
+        adim = self.attn_dim
+
+        # real_iQ: MultiHead iQ (bsize, num_query, vsize) => (bsize, nheads, nquery, adim)
+        # real_iK: MultiHead iK (bsize, seql, vsize) => (bsize, nheads, seql, adim)
+        # real_iV: MultiHead iV (bsize, seql, vsize) => (bsize, nheads, seql, adim)
+
+        real_iQ, _out = self.query_adaptor(iQ).view(bsize, nquery, nheads, adim).transpose(1, 2), self.kv_adaptor(iK)
+
+        real_iK, real_iV = _out.narrow(-1, 0, self.hsize).contiguous().view(bsize, seql, nheads, adim).transpose(1,
+                                                                                                                 2), _out.narrow(
+            -1, self.hsize, self.hsize).contiguous().view(bsize, seql, nheads, adim).transpose(1, 2)
+
+        # scores (bsize, nheads, nquery, adim) * (bsize, nheads, seql, adim)' => (bsize, nheads, nquery, seql)
+
+        scores = torch.div(torch.matmul(real_iQ, real_iK.transpose(2, 3)), sqrt(adim))
+
+        if mask is not None:
+            scores.masked_fill_(torch.unsqueeze(mask, 1).expand_as(scores), -1e32)
+
+        scores = self.normer(scores)
+
+        if self.drop is not None:
+            scores = self.drop(scores)
+
+        # oMA: output of MultiHeadAttention T((bsize, nheads, nquery, seql) * (bsize, nheads, seql, adim)) => (bsize, nquery, nheads, adim)
+
+        oMA = torch.matmul(scores, real_iV).transpose(1, 2).contiguous()
+
+        # output of this layer (bsize, nquery, nheads, adim) => (bsize, nquery, osize)
+
+        return self.outer(oMA.view(bsize, nquery, self.hsize))
 
 
 class PositionwiseFeedForward(nn.Module):
