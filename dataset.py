@@ -10,6 +10,7 @@ def read_a_file(_file):
     flist = list()
     with open(_file, "r", encoding='utf8') as fin:
         for line in fin:
+            line = line.strip()
             flist.append(line.split(" "))
         # print(len(list))
     return flist

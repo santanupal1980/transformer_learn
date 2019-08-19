@@ -2,12 +2,71 @@ import numpy as np
 import torch.nn.functional as F
 
 import torch
-from torch import nn
+from torch import nn, Tensor
 from torch.autograd import Function
-from math import sqrt
+from math import sqrt, log
 
 from transformer import Constants
 
+def freeze_params(module: nn.Module) -> None:
+    """
+    Freeze the parameters of this module,
+    i.e. do not update them during training
+    :param module: freeze parameters of this module
+    """
+    for _, p in module.named_parameters():
+        p.requires_grad = False
+
+class Embeddings(nn.Module):
+
+    """
+    Simple embeddings class
+    """
+
+    # pylint: disable=unused-argument
+    def __init__(self,
+                 embedding_dim: int = 512,
+                 scale: bool = False,
+                 vocab_size: int = 0,
+                 padding_idx: int = 1,
+                 freeze: bool = False,
+                 **kwargs):
+        """
+        Create new embeddings for the vocabulary.
+        Use scaling for the Transformer.
+        :param embedding_dim:
+        :param scale:
+        :param vocab_size:
+        :param padding_idx:
+        :param freeze: freeze the embeddings during training
+        """
+        super(Embeddings, self).__init__()
+
+        self.embedding_dim = embedding_dim
+        self.scale = scale
+        self.vocab_size = vocab_size
+        self.lut = nn.Embedding(vocab_size, self.embedding_dim,
+                                padding_idx=padding_idx)
+        self.weight = self.lut.weight
+
+        if freeze:
+            freeze_params(self)
+
+    # pylint: disable=arguments-differ
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Perform lookup for input `x` in the embedding table.
+        :param x: index in the vocabulary
+        :return: embedded representation for `x`
+        """
+        self.weight = self.lut.weight
+        if self.scale:
+            return self.lut(x) * sqrt(self.embedding_dim)
+        return self.lut(x)
+
+    def __repr__(self):
+        return "%s(embedding_dim=%d, vocab_size=%d)" % (
+            self.__class__.__name__, self.embedding_dim, self.vocab_size)
 
 class ScaledDotProductAttention(nn.Module):
     ''' Scaled Dot-Product Attention '''
@@ -33,14 +92,14 @@ class ScaledDotProductAttention(nn.Module):
         """
 
         # MatMul
-        #attn = torch.matmul(q, k.transpose(1, 2))
+        # attn = torch.matmul(q, k.transpose(1, 2))
         attn = torch.matmul(q, k.transpose(2, 3))
         # Scale
-        #attn = attn / self.temperature
+        # attn = attn / self.temperature
 
         # Mask
         if mask is not None:
-            #attn = attn.masked_fill(mask, -np.inf)
+            # attn = attn.masked_fill(mask, -np.inf)
             attn = attn.masked_fill(~mask.unsqueeze(1), float('-inf'))
 
         # softmax/dropout
@@ -51,6 +110,7 @@ class ScaledDotProductAttention(nn.Module):
         output = torch.matmul(attn, v)
 
         return output, attn
+
 
 class SparseNormer(nn.Module):
 
@@ -71,10 +131,11 @@ class SparseNormer(nn.Module):
         # fix zero-devision in case all elements in _tmp are 0.
         return _tmp / (_tmp.sum(self.dim, keepdim=True) + self.ieps)
 
+
 class MultiHeadAttention(nn.Module):
     ''' Multi-Head Attention module '''
 
-    def __init__(self, n_head, d_model, d_k, d_v, dropout=0.1, sparsenorm = False):
+    def __init__(self, n_head, d_model, d_k, d_v, dropout=0.1, sparsenorm=False):
         super().__init__()
 
         self.attn_dim = d_model // n_head
@@ -88,11 +149,11 @@ class MultiHeadAttention(nn.Module):
         self.ks = nn.Linear(d_model, self.hsize)
         self.vs = nn.Linear(d_model, self.hsize)
 
-        #self.outer = nn.Linear(self.hsize, osize, bias=enable_bias)
+        # self.outer = nn.Linear(self.hsize, osize, bias=enable_bias)
 
         self.normer = SparseNormer(dim=-1) if sparsenorm else nn.Softmax(dim=-1)
 
-        #self.layer_norm = nn.LayerNorm(d_model)
+        # self.layer_norm = nn.LayerNorm(d_model)
 
         self.output_layer = nn.Linear(self.hsize, d_model)
         self.dropout = nn.Dropout(dropout)
@@ -121,7 +182,6 @@ class MultiHeadAttention(nn.Module):
         adim = self.attn_dim
         residual = q
 
-
         ''' # Linear
 
         q = q.permute(2, 0, 1, 3).contiguous().view(-1, len_q, d_k)  # (n*b) x lq x dk
@@ -145,23 +205,62 @@ class MultiHeadAttention(nn.Module):
         if self.dropout is not None:
             scores = self.dropout(scores)
 
-
-
         output = torch.matmul(scores, V).transpose(1, 2).contiguous()
-
 
         output = self.output_layer(output.view(batch_size, len_q, self.hsize))
 
         # Add and Norm
-        #output = self.layer_norm(output.transpose(1, 2) + residual)
+        # output = self.layer_norm(output.transpose(1, 2) + residual)
 
         return output, scores
+
+class PositionalEncoding(nn.Module):
+    """
+    Pre-compute position encodings (PE).
+    In forward pass, this adds the position-encodings to the
+    input for as many time steps as necessary.
+    Implementation based on OpenNMT-py.
+    https://github.com/OpenNMT/OpenNMT-py
+    """
+    def __init__(self,
+                 size: int = 0, #d_model
+                 max_len: int = 5000):
+        """
+        Positional Encoding with maximum length max_len
+        :param size:
+        :param max_len:
+        :param dropout:
+        """
+        if size % 2 != 0:
+            raise ValueError("Cannot use sin/cos positional encoding with "
+                             "odd dim (got dim={:d})".format(size))
+        pe = torch.zeros(max_len, size)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp((torch.arange(0, size, 2, dtype=torch.float) *
+                              -(log(10000.0) / size)))
+        pe[:, 0::2] = torch.sin(position.float() * div_term)
+        pe[:, 1::2] = torch.cos(position.float() * div_term)
+        pe = pe.unsqueeze(0)  # shape: [1, size, max_len]
+        super(PositionalEncoding, self).__init__()
+        self.register_buffer('pe', pe)
+        self.dim = size
+
+    def forward(self, emb):
+        """Embed inputs.
+        Args:
+            emb (FloatTensor): Sequence of word vectors
+                ``(seq_len, batch_size, self.dim)``
+        """
+        # Add position encodings
+        return emb + self.pe[:, :emb.size(1)]
 
 class utils:
 
     def get_non_pad_mask(seq):
         assert seq.dim() == 2
         return seq.ne(Constants.PAD).type(torch.float).unsqueeze(-1)
+
+
 
     def get_sinusoid_encoding_table(n_position, d_hid, padding_idx=None):
         ''' Sinusoid position encoding table '''
@@ -249,19 +348,23 @@ class SelfAttn(nn.Module):
 
             _out = self.adaptor(iQ)
 
-            Q, K, V = _out.narrow(-1, 0, self.hid_size).contiguous().view(bsize, nquery, nheads,adim).transpose(1,2), \
-                      _out.narrow(-1, self.hid_size, self.hid_size).contiguous().view(bsize, nquery, nheads, adim).transpose(1, 2), \
-                       _out.narrow(-1, self.hid_size + self.hid_size, self.hid_size).contiguous().view(bsize, nquery, nheads, adim).transpose(1, 2)
+            Q, K, V = _out.narrow(-1, 0, self.hid_size).contiguous().view(bsize, nquery, nheads, adim).transpose(1, 2), \
+                      _out.narrow(-1, self.hid_size, self.hid_size).contiguous().view(bsize, nquery, nheads,
+                                                                                      adim).transpose(1, 2), \
+                      _out.narrow(-1, self.hid_size + self.hid_size, self.hid_size).contiguous().view(bsize, nquery,
+                                                                                                      nheads,
+                                                                                                      adim).transpose(1,
+                                                                                                                      2)
         else:
 
-            real_iQ, _out = F.linear(iQ, self.adaptor.weight.narrow(0, 0, self.hsize),
-                                          self.adaptor.bias.narrow(0, 0,
-                                                                   self.hsize) if self.adaptor.bias else None).view(
+            Q, _out = F.linear(iQ, self.adaptor.weight.narrow(0, 0, self.hsize),
+                                     self.adaptor.bias.narrow(0, 0,
+                                                              self.hsize) if self.adaptor.bias else None).view(
                 bsize, nquery, nheads, adim).transpose(1, 2), F.linear(iK,
-                                                                            self.adaptor.weight.narrow(0, self.hsize,
-                                                                                                       self.hsize + self.hsize),
-                                                                            self.adaptor.bias.narrow(0, self.hsize,
-                                                                                                     self.hsize + self.hsize) if self.adaptor.bias else None)
+                                                                       self.adaptor.weight.narrow(0, self.hsize,
+                                                                                                  self.hsize + self.hsize),
+                                                                       self.adaptor.bias.narrow(0, self.hsize,
+                                                                                                self.hsize + self.hsize) if self.adaptor.bias else None)
 
             seql = iK.size(1)
 
@@ -363,16 +466,12 @@ class CrossAttn(nn.Module):
 class PositionwiseFeedForward(nn.Module):
     ''' A two-feed-forward-layer module '''
 
-
-
     def __init__(self, d_hid, d_in, dropout=0.1):
         super().__init__()
         self.L_1 = nn.Linear(d_hid, d_in)  # position-wise
         self.L_2 = nn.Linear(d_in, d_hid)  # position-wise
         self.layer_norm = nn.LayerNorm(d_hid, eps=1e-06)
         self.dropout = nn.Dropout(dropout)
-
-
 
     def forward(self, x):
         """
@@ -385,10 +484,10 @@ class PositionwiseFeedForward(nn.Module):
         # feed forward
         residual = x
         output = self.layer_norm(x)
-        #output = output.transpose(1, 2)
+        # output = output.transpose(1, 2)
         output = self.L_1(output)
         output = self.L_2(F.relu(output))
-        #output = output.transpose(1, 2)
+        # output = output.transpose(1, 2)
         output = self.dropout(output)
 
         # Add and norm

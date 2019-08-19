@@ -2,16 +2,21 @@ import json
 import os
 import random
 import time
-
+import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+from random import seed as rpyseed
+from random import shuffle, sample
+from torch.nn.init import xavier_uniform_
 
 import transformer
 # from transformer.Translator import Chatbot
 from dataset import Dataset
 from transformer.Models import Transformer
+
+#from torch.utils.tensorboard import SummaryWriter
 
 # load config
 with open("config.json", "r") as f:
@@ -26,14 +31,16 @@ if not os.path.exists(config["output_dir"]):
 
 # create train dataset
 train_dataset = Dataset(
-    os.path.join(config["dataset_filename"], "all.bpe.src-mt"),
+    os.path.join(config["dataset_filename"], "all.bpe.mt"),
     os.path.join(config["dataset_filename"], "all.bpe.pe"),
     config["history_len"],
     config["response_len"])
 
+
+
 # creat validation dataset
 val_dataset = Dataset(
-    os.path.join(config["dataset_filename"], "dev.bpe.src-mt"),
+    os.path.join(config["dataset_filename"], "dev.bpe.mt"),
     os.path.join(config["dataset_filename"], "dev.bpe.pe"),
     config["history_len"],
     config["response_len"],
@@ -115,7 +122,8 @@ class ScheduledOptim():
 # create optimizer
 optimizer = torch.optim.Adam(
     filter(lambda x: x.requires_grad, model.parameters()),
-    betas=(0.9, 0.98), eps=1e-09)
+    betas=(0.9, 0.98), eps=1e-09, lr=1e-4, amsgrad=False)
+
 
 # create a sceduled optimizer object
 optimizer = ScheduledOptim(
@@ -277,12 +285,54 @@ def backward(phase, pred, gold, config):
     return float(loss), n_correct
 
 
+
+def getlr(optm):
+    lr = []
+    for i, param_group in enumerate(optm.param_groups):
+        lr.append(float(param_group['lr']))
+    return lr
+
+def tostr(lin):
+    return [str(lu) for lu in lin]
+
+
+def get_logger(fname):
+    logger = logging.getLogger(__name__)
+    logger.setLevel(level=logging.INFO)
+    handler = logging.FileHandler(fname)
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('[%(asctime)s %(levelname)s] %(message)s')
+    handler.setFormatter(formatter)
+
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+
+    logger.addHandler(handler)
+    logger.addHandler(console)
+    return logger
 # initialize results, add config to them
 results = dict()
 results["config"] = config
 
 # initialize lowest validation loss, use to save weights
 lowest_loss = 999
+
+logger = get_logger(config["output_dir"] + "train.log")  # Logger object
+
+random_seed = torch.initial_seed() if config["seed"] is None else config["seed"]
+
+rpyseed(random_seed)
+use_cuda =False
+
+if config["device"] == 'cuda':
+    use_cuda = True
+
+if use_cuda:
+     torch.cuda.manual_seed_all(random_seed)
+     print('[Info] Setting up random seed using CUDA.')
+else:
+     torch.manual_seed(random_seed)
+
 
 # begin training
 for i in range(config["num_epochs"]):
@@ -296,6 +346,7 @@ for i in range(config["num_epochs"]):
             # set model to training mode
             model.train()
             dataloader = data_loader_train
+
             batch_size = config["train_batch_size"]
         else:
             # set model to evaluation mode
@@ -320,6 +371,7 @@ for i in range(config["num_epochs"]):
             epoch_loss.append(loss)
             average_epoch_loss = np.mean(epoch_loss)
 
+
             # get_accuracy
             non_pad_mask = gold.ne(transformer.Constants.PAD)
             n_word = non_pad_mask.sum().item()
@@ -337,6 +389,7 @@ for i in range(config["num_epochs"]):
         phase_metrics["time_taken"] = time.time() - start
 
         epoch_metrics[phase] = phase_metrics
+        print(epoch_metrics[phase])
 
         # save model if val loss is lower than any of the previous epochs
         if phase == "val":
@@ -347,4 +400,6 @@ for i in range(config["num_epochs"]):
                 save_checkpoint(filename, model, optimizer.optimizer)
                 lowest_loss = average_epoch_loss
     epoch = i
+    logger.info("Epoch: %d ||| train loss: %.3f ||| Perplexity:%.3f ||| time: %.3f"
+                % (i, phase_metrics["loss"], phase_metrics["perplexity"], phase_metrics["time_taken"]))
     results["epoch_{}".format(epoch)] = epoch_metrics

@@ -3,7 +3,7 @@ import torch.nn as nn
 
 import transformer.Constants as Constants
 from transformer.Layers import DecoderLayer
-from transformer.Modules import utils
+from transformer.Modules import utils, PositionalEncoding, Embeddings
 
 
 class Decoder(nn.Module):
@@ -19,15 +19,17 @@ class Decoder(nn.Module):
         n_position = len_max_seq + 1
 
         if pretrained_embeddings is None:
-            self.tgt_word_emb = nn.Embedding(
-                n_tgt_vocab, d_word_vec, padding_idx=Constants.PAD)
+            '''self.tgt_word_emb = nn.Embedding(
+                n_tgt_vocab, d_word_vec, padding_idx=Constants.PAD)'''
+            self.tgt_word_emb = Embeddings(embedding_dim=d_model, padding_idx=Constants.PAD, vocab_size=n_tgt_vocab)
         else:
             self.tgt_word_emb = nn.Embedding.from_pretrained(
                 pretrained_embeddings, padding_idx=Constants.PAD)
 
-        self.position_enc = nn.Embedding.from_pretrained(
+        '''self.position_enc = nn.Embedding.from_pretrained(
             utils.get_sinusoid_encoding_table(n_position, d_word_vec, padding_idx=0),
-            freeze=True)
+            freeze=True)'''
+        self.position_enc = PositionalEncoding(d_model, len_max_seq)
 
         self.layer_stack = nn.ModuleList([
             DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
@@ -58,8 +60,10 @@ class Decoder(nn.Module):
 
         dec_enc_attn_mask = utils.get_attn_key_pad_mask(seq_k=src_seq, seq_q=tgt_seq)
 
+        emb = self.tgt_word_emb(tgt_seq)
+
         # -- Forward
-        dec_output = self.tgt_word_emb(tgt_seq) + self.position_enc(tgt_pos)
+        dec_output =  self.position_enc(emb)
 
         # Nx decoder layer
         for dec_layer in self.layer_stack:
