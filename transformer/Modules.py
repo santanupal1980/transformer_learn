@@ -313,7 +313,12 @@ class SelfAttn(nn.Module):
     # dropout: dropout probability
     # sparsenorm: using sparse normer or standard softmax
 
-    def __init__(self, input_size, hid_size, out_size, num_head=8, dropout=0.0, enable_bias=False, sparsenorm=False):
+    def __init__(self, n_head, d_model, dropout=0.1, enable_bias = False, sparsenorm=False):
+
+        input_size = d_model
+        hid_size = d_model
+        out_size = d_model
+        num_head = n_head
 
         super(SelfAttn, self).__init__()
 
@@ -368,13 +373,13 @@ class SelfAttn(nn.Module):
 
             seql = iK.size(1)
 
-            real_iK, real_iV = _out.narrow(-1, 0, self.hsize).contiguous().view(bsize, seql, nheads, adim).transpose(1,
+            K, V = _out.narrow(-1, 0, self.hsize).contiguous().view(bsize, seql, nheads, adim).transpose(1,
                                                                                                                      2), _out.narrow(
                 -1, self.hsize, self.hsize).contiguous().view(bsize, seql, nheads, adim).transpose(1, 2)
 
         # scores (bsize, nheads, nquery, adim) * (bsize, nheads, nquery, adim)' => (bsize, nheads, nquery, nquery)
 
-        scores = torch.div(torch.matmul(real_iQ, real_iK.transpose(2, 3)), sqrt(adim))
+        scores = torch.div(torch.matmul(Q, K.transpose(2, 3)), sqrt(adim))
 
         if mask is not None:
             scores.masked_fill_(torch.unsqueeze(mask, 1).expand_as(scores), -1e32)
@@ -386,11 +391,11 @@ class SelfAttn(nn.Module):
 
         # oMA: output of MultiHeadAttention T((bsize, nheads, nquery, nquery) * (bsize, nheads, nquery, adim)) => (bsize, nquery, nheads, adim)
 
-        oMA = torch.matmul(scores, real_iV).transpose(1, 2).contiguous()
+        oMA = torch.matmul(scores, V).transpose(1, 2).contiguous()
 
         # output of this layer (bsize, nquery, nheads, adim) => (bsize, nquery, osize)
 
-        return self.outer(oMA.view(bsize, nquery, self.hsize))
+        return self.outer(oMA.view(bsize, nquery, self.hid_size)), scores
 
 
 # Accelerated MultiHeadAttn for cross attention, use when K == V
@@ -403,8 +408,12 @@ class CrossAttn(nn.Module):
     # dropout: dropout probability
     # sparsenorm: using sparse normer or standard softmax
 
-    def __init__(self, isize, hsize, osize, num_head=8, dropout=0.0, enable_bias=False, sparsenorm=False):
+    def __init__(self, n_head, d_model, dropout=0.1, enable_bias = False, sparsenorm=False):
 
+        isize = d_model
+        hsize = d_model
+        osize = d_model
+        num_head = n_head
         super(CrossAttn, self).__init__()
 
         self.attn_dim = hsize // num_head
@@ -460,7 +469,7 @@ class CrossAttn(nn.Module):
 
         # output of this layer (bsize, nquery, nheads, adim) => (bsize, nquery, osize)
 
-        return self.outer(oMA.view(bsize, nquery, self.hsize))
+        return self.outer(oMA.view(bsize, nquery, self.hsize)), scores
 
 
 class PositionwiseFeedForward(nn.Module):

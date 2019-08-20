@@ -19,20 +19,14 @@ class Encoder(nn.Module):
         n_position = len_max_seq + 1
 
         if pretrained_embeddings is None:
-            #self.src_word_emb = nn.Embedding(
-              #  n_src_vocab, d_word_vec, padding_idx=Constants.PAD)
             self.src_word_emb = Embeddings(embedding_dim=d_model, padding_idx=Constants.PAD, vocab_size=n_src_vocab)
         else:
             self.src_word_emb = nn.Embedding.from_pretrained(
                 pretrained_embeddings, padding_idx=Constants.PAD)
 
-        '''self.position_enc = nn.Embedding.from_pretrained(
-            utils.get_sinusoid_encoding_table(n_position, d_word_vec, padding_idx=0),
-            freeze=True)'''
-
         self.position_enc = PositionalEncoding(d_model, len_max_seq)
 
-        self.segment_enc = nn.Embedding(int(n_position / 2), d_word_vec, padding_idx=0)
+
 
         self.layer_stack = nn.ModuleList([
             EncoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
@@ -53,11 +47,14 @@ class Encoder(nn.Module):
         enc_slf_attn_list = []
 
         # -- Prepare masks
-        slf_attn_mask = utils.get_attn_key_pad_mask(seq_k=src_seq, seq_q=src_seq)
+        #slf_attn_mask = utils.get_attn_key_pad_mask(seq_k=src_seq, seq_q=src_seq)
+        slf_attn_mask = src_seq.eq(0).unsqueeze(1) #if src_mask is None else src_mask
+        #_
         non_pad_mask = utils.get_non_pad_mask(src_seq)
+        # -- Word embeddings
         emb = self.src_word_emb(src_seq)
         # -- Get input embeddings
-        enc_output =  self.position_enc(emb) # + self.segment_enc(src_seg)
+        enc_output =  self.position_enc(emb)
 
         # Nx encoder layer
         for enc_layer in self.layer_stack:

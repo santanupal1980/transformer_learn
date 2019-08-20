@@ -1,9 +1,7 @@
 ''' Define the Layers '''
 import torch.nn as nn
 
-from transformer.Modules import MultiHeadAttention, PositionwiseFeedForward
-
-__author__ = "Yu-Hsiang Huang"
+from transformer.Modules import MultiHeadAttention, PositionwiseFeedForward, SelfAttn, CrossAttn
 
 
 class EncoderLayer(nn.Module):
@@ -11,8 +9,8 @@ class EncoderLayer(nn.Module):
 
     def __init__(self, d_model, d_inner, n_head, d_k, d_v, dropout=0.1):
         super(EncoderLayer, self).__init__()
-        self.slf_attn = MultiHeadAttention(
-            n_head, d_model, d_k, d_v, dropout=dropout)
+        self.slf_attn = SelfAttn(
+            n_head, d_model, dropout=dropout)
         self.pos_ffn = PositionwiseFeedForward(d_model, d_inner, dropout=dropout)
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-06)
 
@@ -27,11 +25,10 @@ class EncoderLayer(nn.Module):
         """
         # Multi-Head Attention (w/ Add and Norm)
         enc_output, enc_slf_attn = self.slf_attn(
-            enc_input, enc_input, enc_input, mask=slf_attn_mask)
+            enc_input, mask=slf_attn_mask)
         enc_output *= non_pad_mask
 
-
-        #TODO CHECK add&norm or Norm&add
+        # TODO CHECK add&norm or Norm&add
         enc_output = enc_output + enc_input
         enc_output = self.layer_norm(enc_output)
 
@@ -48,8 +45,8 @@ class DecoderLayer(nn.Module):
 
     def __init__(self, d_model, d_inner, n_head, d_k, d_v, dropout=0.1):
         super(DecoderLayer, self).__init__()
-        self.slf_attn = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
-        self.enc_attn = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
+        self.slf_attn = SelfAttn(n_head, d_model, dropout=dropout)
+        self.enc_dec_attn = CrossAttn(n_head, d_model, dropout=dropout)
         self.pos_ffn = PositionwiseFeedForward(d_model, d_inner, dropout=dropout)
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-06)
 
@@ -68,13 +65,11 @@ class DecoderLayer(nn.Module):
             dec_output: output from decoder
         """
         # Masked Multi-Head Attention (w/ Add and Norm)
-        dec_output, dec_slf_attn = self.slf_attn(
-            dec_input, dec_input, dec_input, mask=slf_attn_mask)
+        dec_output, dec_slf_attn = self.slf_attn(dec_input, mask=slf_attn_mask)
         dec_output *= non_pad_mask
 
         # Multi-Head Attention (w/ Add and Norm)
-        dec_output, dec_enc_attn = self.enc_attn(
-            dec_output, enc_output, enc_output, mask=dec_enc_attn_mask)
+        dec_output, dec_enc_attn = self.enc_dec_attn(dec_output, enc_output, mask=dec_enc_attn_mask)
         dec_output *= non_pad_mask
 
         # TODO CHECK add&norm or Norm&add
